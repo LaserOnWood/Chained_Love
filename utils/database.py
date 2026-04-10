@@ -1,360 +1,429 @@
 """
-Database manager – PostgreSQL via asyncpg.
-Initialise le schéma complet au premier lancement.
+Database manager – SQLite via aiosqlite.
+Compatible Railway (fichier dans le volume) et homelab (fichier local).
+
+Variable d'environnement :
+  DB_PATH – chemin vers le fichier SQLite (défaut : ./chained_love.db)
 """
-import asyncpg
 import os
+import aiosqlite
+
+DB_PATH = os.environ.get("DB_PATH", "chained_love.db")
 
 
-async def get_pool() -> asyncpg.Pool:
-    return await asyncpg.create_pool(dsn=os.environ["DATABASE_URL"])
+async def get_conn() -> aiosqlite.Connection:
+    conn = await aiosqlite.connect(DB_PATH)
+    conn.row_factory = aiosqlite.Row
+    await conn.execute("PRAGMA journal_mode=WAL")
+    await conn.execute("PRAGMA foreign_keys=ON")
+    return conn
 
+
+# ── Schéma ─────────────────────────────────────────────────────────────────────
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS pairs (
-    id          SERIAL PRIMARY KEY,
-    dom_id      BIGINT NOT NULL,
-    sub_id      BIGINT NOT NULL,
-    guild_id    BIGINT NOT NULL,
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    dom_id      INTEGER NOT NULL,
+    sub_id      INTEGER NOT NULL,
+    guild_id    INTEGER NOT NULL,
     dom_label   TEXT NOT NULL DEFAULT 'Dominant',
     sub_label   TEXT NOT NULL DEFAULT 'Subordonné',
-    active      BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    active      INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(dom_id, sub_id, guild_id)
 );
 
 CREATE TABLE IF NOT EXISTS wallets (
-    pair_id INT PRIMARY KEY REFERENCES pairs(id) ON DELETE CASCADE,
-    points  INT NOT NULL DEFAULT 0
+    pair_id INTEGER PRIMARY KEY REFERENCES pairs(id) ON DELETE CASCADE,
+    points  INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
-    id             SERIAL PRIMARY KEY,
-    pair_id        INT NOT NULL REFERENCES pairs(id) ON DELETE CASCADE,
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    pair_id        INTEGER NOT NULL REFERENCES pairs(id) ON DELETE CASCADE,
     name           TEXT NOT NULL,
     description    TEXT,
-    points         INT NOT NULL DEFAULT 10,
+    points         INTEGER NOT NULL DEFAULT 10,
     recurrence     TEXT NOT NULL DEFAULT 'daily',
-    requires_proof BOOLEAN NOT NULL DEFAULT FALSE,
-    active         BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    requires_proof INTEGER NOT NULL DEFAULT 0,
+    active         INTEGER NOT NULL DEFAULT 1,
+    created_at     TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS task_completions (
-    id           SERIAL PRIMARY KEY,
-    task_id      INT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-    pair_id      INT NOT NULL REFERENCES pairs(id) ON DELETE CASCADE,
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id      INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    pair_id      INTEGER NOT NULL REFERENCES pairs(id) ON DELETE CASCADE,
     proof_url    TEXT,
-    validated    BOOLEAN,
-    completed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    validated    INTEGER,
+    completed_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS shop_items (
-    id          SERIAL PRIMARY KEY,
-    pair_id     INT NOT NULL REFERENCES pairs(id) ON DELETE CASCADE,
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    pair_id     INTEGER NOT NULL REFERENCES pairs(id) ON DELETE CASCADE,
     name        TEXT NOT NULL,
     description TEXT,
-    cost        INT NOT NULL DEFAULT 50,
-    active      BOOLEAN NOT NULL DEFAULT TRUE
+    cost        INTEGER NOT NULL DEFAULT 50,
+    active      INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS purchases (
-    id           SERIAL PRIMARY KEY,
-    item_id      INT NOT NULL REFERENCES shop_items(id) ON DELETE CASCADE,
-    pair_id      INT NOT NULL REFERENCES pairs(id) ON DELETE CASCADE,
-    validated    BOOLEAN,
-    purchased_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id      INTEGER NOT NULL REFERENCES shop_items(id) ON DELETE CASCADE,
+    pair_id      INTEGER NOT NULL REFERENCES pairs(id) ON DELETE CASCADE,
+    validated    INTEGER,
+    purchased_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS limits (
-    id          SERIAL PRIMARY KEY,
-    pair_id     INT NOT NULL REFERENCES pairs(id) ON DELETE CASCADE,
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    pair_id     INTEGER NOT NULL REFERENCES pairs(id) ON DELETE CASCADE,
     name        TEXT NOT NULL,
     color       TEXT NOT NULL CHECK (color IN ('green','orange','red')),
     description TEXT,
-    created_by  BIGINT NOT NULL
+    created_by  INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS safeword_events (
-    id           SERIAL PRIMARY KEY,
-    pair_id      INT NOT NULL REFERENCES pairs(id) ON DELETE CASCADE,
-    triggered_by BIGINT NOT NULL,
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    pair_id      INTEGER NOT NULL REFERENCES pairs(id) ON DELETE CASCADE,
+    triggered_by INTEGER NOT NULL,
     level        TEXT NOT NULL CHECK (level IN ('YELLOW','RED')),
-    resolved     BOOLEAN NOT NULL DEFAULT FALSE,
-    triggered_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    resolved     INTEGER NOT NULL DEFAULT 0,
+    triggered_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS checkins (
-    id         SERIAL PRIMARY KEY,
-    pair_id    INT NOT NULL REFERENCES pairs(id) ON DELETE CASCADE,
-    sub_id     BIGINT NOT NULL,
-    mood       INT NOT NULL CHECK (mood BETWEEN 1 AND 10),
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    pair_id    INTEGER NOT NULL REFERENCES pairs(id) ON DELETE CASCADE,
+    sub_id     INTEGER NOT NULL,
+    mood       INTEGER NOT NULL CHECK (mood BETWEEN 1 AND 10),
     note       TEXT,
-    checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    checked_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS reminder_settings (
-    pair_id      INT PRIMARY KEY REFERENCES pairs(id) ON DELETE CASCADE,
-    reminders_on BOOLEAN NOT NULL DEFAULT TRUE,
-    checkin_hour INT NOT NULL DEFAULT 21
+    pair_id      INTEGER PRIMARY KEY REFERENCES pairs(id) ON DELETE CASCADE,
+    reminders_on INTEGER NOT NULL DEFAULT 1,
+    checkin_hour INTEGER NOT NULL DEFAULT 21
 );
 """
 
 
-async def init_db(pool: asyncpg.Pool):
-    async with pool.acquire() as conn:
-        await conn.execute(SCHEMA)
+async def init_db():
+    async with await get_conn() as conn:
+        await conn.executescript(SCHEMA)
+        await conn.commit()
 
 
 # ── Pairs ──────────────────────────────────────────────────────────────────────
 
-async def create_pair(pool, dom_id, sub_id, guild_id) -> int:
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
+async def create_pair(dom_id, sub_id, guild_id) -> int:
+    async with await get_conn() as conn:
+        await conn.execute(
             """INSERT INTO pairs (dom_id, sub_id, guild_id)
-               VALUES ($1, $2, $3)
-               ON CONFLICT (dom_id, sub_id, guild_id) DO UPDATE SET active = TRUE
-               RETURNING id""",
-            dom_id, sub_id, guild_id,
+               VALUES (?, ?, ?)
+               ON CONFLICT(dom_id, sub_id, guild_id)
+               DO UPDATE SET active=1""",
+            (dom_id, sub_id, guild_id),
         )
+        cur = await conn.execute(
+            "SELECT id FROM pairs WHERE dom_id=? AND sub_id=? AND guild_id=?",
+            (dom_id, sub_id, guild_id),
+        )
+        row = await cur.fetchone()
         pid = row["id"]
-        await conn.execute("INSERT INTO wallets (pair_id) VALUES ($1) ON CONFLICT DO NOTHING", pid)
-        await conn.execute("INSERT INTO reminder_settings (pair_id) VALUES ($1) ON CONFLICT DO NOTHING", pid)
+        await conn.execute("INSERT OR IGNORE INTO wallets (pair_id) VALUES (?)", (pid,))
+        await conn.execute("INSERT OR IGNORE INTO reminder_settings (pair_id) VALUES (?)", (pid,))
+        await conn.commit()
         return pid
 
 
-async def get_pair_by_users(pool, user_a, user_b, guild_id):
-    async with pool.acquire() as conn:
-        return await conn.fetchrow(
-            """SELECT * FROM pairs WHERE guild_id=$3 AND active=TRUE
-               AND ((dom_id=$1 AND sub_id=$2) OR (dom_id=$2 AND sub_id=$1))""",
-            user_a, user_b, guild_id,
+async def get_pair_by_users(user_a, user_b, guild_id):
+    async with await get_conn() as conn:
+        cur = await conn.execute(
+            """SELECT * FROM pairs WHERE guild_id=? AND active=1
+               AND ((dom_id=? AND sub_id=?) OR (dom_id=? AND sub_id=?))""",
+            (guild_id, user_a, user_b, user_b, user_a),
         )
+        return await cur.fetchone()
 
 
-async def get_pairs_for_user(pool, user_id, guild_id):
-    async with pool.acquire() as conn:
-        return await conn.fetch(
-            "SELECT * FROM pairs WHERE guild_id=$2 AND active=TRUE AND (dom_id=$1 OR sub_id=$1)",
-            user_id, guild_id,
+async def get_pairs_for_user(user_id, guild_id):
+    async with await get_conn() as conn:
+        cur = await conn.execute(
+            "SELECT * FROM pairs WHERE guild_id=? AND active=1 AND (dom_id=? OR sub_id=?)",
+            (guild_id, user_id, user_id),
         )
+        return await cur.fetchall()
 
 
-async def get_pair(pool, pair_id):
-    async with pool.acquire() as conn:
-        return await conn.fetchrow("SELECT * FROM pairs WHERE id=$1", pair_id)
+async def get_pair(pair_id):
+    async with await get_conn() as conn:
+        cur = await conn.execute("SELECT * FROM pairs WHERE id=?", (pair_id,))
+        return await cur.fetchone()
 
 
-async def dissolve_pair(pool, pair_id):
-    async with pool.acquire() as conn:
-        await conn.execute("UPDATE pairs SET active=FALSE WHERE id=$1", pair_id)
+async def dissolve_pair(pair_id):
+    async with await get_conn() as conn:
+        await conn.execute("UPDATE pairs SET active=0 WHERE id=?", (pair_id,))
+        await conn.commit()
 
 
 # ── Wallets ────────────────────────────────────────────────────────────────────
 
-async def get_balance(pool, pair_id) -> int:
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT points FROM wallets WHERE pair_id=$1", pair_id)
+async def get_balance(pair_id) -> int:
+    async with await get_conn() as conn:
+        cur = await conn.execute("SELECT points FROM wallets WHERE pair_id=?", (pair_id,))
+        row = await cur.fetchone()
         return row["points"] if row else 0
 
 
-async def add_points(pool, pair_id, amount):
-    async with pool.acquire() as conn:
-        await conn.execute("UPDATE wallets SET points=points+$1 WHERE pair_id=$2", amount, pair_id)
+async def add_points(pair_id, amount):
+    async with await get_conn() as conn:
+        await conn.execute("UPDATE wallets SET points=points+? WHERE pair_id=?", (amount, pair_id))
+        await conn.commit()
 
 
-async def deduct_points(pool, pair_id, amount) -> bool:
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT points FROM wallets WHERE pair_id=$1", pair_id)
+async def deduct_points(pair_id, amount) -> bool:
+    async with await get_conn() as conn:
+        cur = await conn.execute("SELECT points FROM wallets WHERE pair_id=?", (pair_id,))
+        row = await cur.fetchone()
         if not row or row["points"] < amount:
             return False
-        await conn.execute("UPDATE wallets SET points=points-$1 WHERE pair_id=$2", amount, pair_id)
+        await conn.execute("UPDATE wallets SET points=points-? WHERE pair_id=?", (amount, pair_id))
+        await conn.commit()
         return True
 
 
 # ── Tasks ──────────────────────────────────────────────────────────────────────
 
-async def create_task(pool, pair_id, name, description, points, recurrence, requires_proof) -> int:
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
+async def create_task(pair_id, name, description, points, recurrence, requires_proof) -> int:
+    async with await get_conn() as conn:
+        cur = await conn.execute(
             """INSERT INTO tasks (pair_id,name,description,points,recurrence,requires_proof)
-               VALUES ($1,$2,$3,$4,$5,$6) RETURNING id""",
-            pair_id, name, description, points, recurrence, requires_proof,
+               VALUES (?,?,?,?,?,?)""",
+            (pair_id, name, description, points, recurrence, 1 if requires_proof else 0),
         )
-        return row["id"]
+        await conn.commit()
+        return cur.lastrowid
 
 
-async def get_tasks(pool, pair_id):
-    async with pool.acquire() as conn:
-        return await conn.fetch(
-            "SELECT * FROM tasks WHERE pair_id=$1 AND active=TRUE ORDER BY id", pair_id
+async def get_tasks(pair_id):
+    async with await get_conn() as conn:
+        cur = await conn.execute(
+            "SELECT * FROM tasks WHERE pair_id=? AND active=1 ORDER BY id", (pair_id,)
         )
+        return await cur.fetchall()
 
 
-async def get_task(pool, task_id):
-    async with pool.acquire() as conn:
-        return await conn.fetchrow("SELECT * FROM tasks WHERE id=$1", task_id)
+async def get_task(task_id):
+    async with await get_conn() as conn:
+        cur = await conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,))
+        return await cur.fetchone()
 
 
-async def delete_task(pool, task_id):
-    async with pool.acquire() as conn:
-        await conn.execute("UPDATE tasks SET active=FALSE WHERE id=$1", task_id)
+async def delete_task(task_id):
+    async with await get_conn() as conn:
+        await conn.execute("UPDATE tasks SET active=0 WHERE id=?", (task_id,))
+        await conn.commit()
 
 
-async def add_completion(pool, task_id, pair_id, proof_url=None) -> int:
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "INSERT INTO task_completions (task_id,pair_id,proof_url) VALUES ($1,$2,$3) RETURNING id",
-            task_id, pair_id, proof_url,
+async def add_completion(task_id, pair_id, proof_url=None) -> int:
+    async with await get_conn() as conn:
+        cur = await conn.execute(
+            "INSERT INTO task_completions (task_id,pair_id,proof_url) VALUES (?,?,?)",
+            (task_id, pair_id, proof_url),
         )
-        return row["id"]
+        await conn.commit()
+        return cur.lastrowid
 
 
-async def validate_completion(pool, completion_id, validated: bool):
-    async with pool.acquire() as conn:
+async def validate_completion(completion_id, validated: bool):
+    async with await get_conn() as conn:
         await conn.execute(
-            "UPDATE task_completions SET validated=$1 WHERE id=$2", validated, completion_id
+            "UPDATE task_completions SET validated=? WHERE id=?",
+            (1 if validated else 0, completion_id),
         )
+        await conn.commit()
 
 
-async def get_weekly_stats(pool, pair_id):
-    async with pool.acquire() as conn:
-        return await conn.fetchrow(
+async def get_weekly_stats(pair_id):
+    async with await get_conn() as conn:
+        cur = await conn.execute(
             """SELECT
-                COUNT(*) FILTER (WHERE validated=TRUE)  AS done,
-                COUNT(*) FILTER (WHERE validated IS NULL) AS pending,
-                COUNT(*) FILTER (WHERE validated=FALSE) AS refused
+                SUM(CASE WHEN validated=1 THEN 1 ELSE 0 END)  AS done,
+                SUM(CASE WHEN validated IS NULL THEN 1 ELSE 0 END) AS pending,
+                SUM(CASE WHEN validated=0 THEN 1 ELSE 0 END)  AS refused
                FROM task_completions
-               WHERE pair_id=$1 AND completed_at > NOW() - INTERVAL '7 days'""",
-            pair_id,
+               WHERE pair_id=?
+               AND completed_at >= datetime('now', '-7 days')""",
+            (pair_id,),
         )
+        return await cur.fetchone()
 
 
 # ── Shop ───────────────────────────────────────────────────────────────────────
 
-async def create_shop_item(pool, pair_id, name, description, cost) -> int:
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "INSERT INTO shop_items (pair_id,name,description,cost) VALUES ($1,$2,$3,$4) RETURNING id",
-            pair_id, name, description, cost,
+async def create_shop_item(pair_id, name, description, cost) -> int:
+    async with await get_conn() as conn:
+        cur = await conn.execute(
+            "INSERT INTO shop_items (pair_id,name,description,cost) VALUES (?,?,?,?)",
+            (pair_id, name, description, cost),
         )
-        return row["id"]
+        await conn.commit()
+        return cur.lastrowid
 
 
-async def get_shop_items(pool, pair_id):
-    async with pool.acquire() as conn:
-        return await conn.fetch(
-            "SELECT * FROM shop_items WHERE pair_id=$1 AND active=TRUE ORDER BY cost", pair_id
+async def get_shop_items(pair_id):
+    async with await get_conn() as conn:
+        cur = await conn.execute(
+            "SELECT * FROM shop_items WHERE pair_id=? AND active=1 ORDER BY cost", (pair_id,)
         )
+        return await cur.fetchall()
 
 
-async def create_purchase(pool, item_id, pair_id) -> int:
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "INSERT INTO purchases (item_id,pair_id) VALUES ($1,$2) RETURNING id",
-            item_id, pair_id,
+async def create_purchase(item_id, pair_id) -> int:
+    async with await get_conn() as conn:
+        cur = await conn.execute(
+            "INSERT INTO purchases (item_id,pair_id) VALUES (?,?)", (item_id, pair_id)
         )
-        return row["id"]
+        await conn.commit()
+        return cur.lastrowid
 
 
-async def validate_purchase(pool, purchase_id, validated: bool):
-    async with pool.acquire() as conn:
+async def validate_purchase(purchase_id, validated: bool):
+    async with await get_conn() as conn:
         await conn.execute(
-            "UPDATE purchases SET validated=$1 WHERE id=$2", validated, purchase_id
+            "UPDATE purchases SET validated=? WHERE id=?",
+            (1 if validated else 0, purchase_id),
         )
+        await conn.commit()
 
 
-async def get_purchase(pool, purchase_id):
-    async with pool.acquire() as conn:
-        return await conn.fetchrow(
+async def get_purchase(purchase_id):
+    async with await get_conn() as conn:
+        cur = await conn.execute(
             """SELECT p.*, si.cost, si.name AS item_name
                FROM purchases p JOIN shop_items si ON si.id=p.item_id
-               WHERE p.id=$1""",
-            purchase_id,
+               WHERE p.id=?""",
+            (purchase_id,),
         )
+        return await cur.fetchone()
 
 
 # ── Limits ─────────────────────────────────────────────────────────────────────
 
-async def add_limit(pool, pair_id, name, color, description, created_by) -> int:
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "INSERT INTO limits (pair_id,name,color,description,created_by) VALUES ($1,$2,$3,$4,$5) RETURNING id",
-            pair_id, name, color, description, created_by,
+async def add_limit(pair_id, name, color, description, created_by) -> int:
+    async with await get_conn() as conn:
+        cur = await conn.execute(
+            "INSERT INTO limits (pair_id,name,color,description,created_by) VALUES (?,?,?,?,?)",
+            (pair_id, name, color, description, created_by),
         )
-        return row["id"]
+        await conn.commit()
+        return cur.lastrowid
 
 
-async def get_limits(pool, pair_id):
-    async with pool.acquire() as conn:
-        return await conn.fetch(
-            "SELECT * FROM limits WHERE pair_id=$1 ORDER BY color, name", pair_id
+async def get_limits(pair_id):
+    async with await get_conn() as conn:
+        cur = await conn.execute(
+            "SELECT * FROM limits WHERE pair_id=? ORDER BY color, name", (pair_id,)
         )
+        return await cur.fetchall()
 
 
-async def delete_limit(pool, limit_id):
-    async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM limits WHERE id=$1", limit_id)
+async def delete_limit(limit_id):
+    async with await get_conn() as conn:
+        await conn.execute("DELETE FROM limits WHERE id=?", (limit_id,))
+        await conn.commit()
+
+
+async def get_limit_by_id(limit_id):
+    async with await get_conn() as conn:
+        cur = await conn.execute("SELECT * FROM limits WHERE id=?", (limit_id,))
+        return await cur.fetchone()
 
 
 # ── Safewords ──────────────────────────────────────────────────────────────────
 
-async def log_safeword(pool, pair_id, triggered_by, level) -> int:
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "INSERT INTO safeword_events (pair_id,triggered_by,level) VALUES ($1,$2,$3) RETURNING id",
-            pair_id, triggered_by, level,
+async def log_safeword(pair_id, triggered_by, level) -> int:
+    async with await get_conn() as conn:
+        cur = await conn.execute(
+            "INSERT INTO safeword_events (pair_id,triggered_by,level) VALUES (?,?,?)",
+            (pair_id, triggered_by, level),
         )
-        return row["id"]
+        await conn.commit()
+        return cur.lastrowid
 
 
-async def resolve_safeword(pool, event_id):
-    async with pool.acquire() as conn:
-        await conn.execute("UPDATE safeword_events SET resolved=TRUE WHERE id=$1", event_id)
+async def resolve_safeword(event_id):
+    async with await get_conn() as conn:
+        await conn.execute("UPDATE safeword_events SET resolved=1 WHERE id=?", (event_id,))
+        await conn.commit()
 
 
-async def get_active_safeword(pool, pair_id):
-    async with pool.acquire() as conn:
-        return await conn.fetchrow(
+async def get_active_safeword(pair_id):
+    async with await get_conn() as conn:
+        cur = await conn.execute(
             """SELECT * FROM safeword_events
-               WHERE pair_id=$1 AND resolved=FALSE
+               WHERE pair_id=? AND resolved=0
                ORDER BY triggered_at DESC LIMIT 1""",
-            pair_id,
+            (pair_id,),
         )
+        return await cur.fetchone()
 
 
 # ── Reminders ──────────────────────────────────────────────────────────────────
 
-async def set_reminders(pool, pair_id, on: bool):
-    async with pool.acquire() as conn:
+async def set_reminders(pair_id, on: bool):
+    async with await get_conn() as conn:
         await conn.execute(
-            "UPDATE reminder_settings SET reminders_on=$1 WHERE pair_id=$2", on, pair_id
+            "UPDATE reminder_settings SET reminders_on=? WHERE pair_id=?",
+            (1 if on else 0, pair_id),
         )
+        await conn.commit()
 
 
-async def get_all_active_pairs_with_reminders(pool):
-    async with pool.acquire() as conn:
-        return await conn.fetch(
+async def get_all_active_pairs_with_reminders():
+    async with await get_conn() as conn:
+        cur = await conn.execute(
             """SELECT p.*, rs.reminders_on, rs.checkin_hour
                FROM pairs p JOIN reminder_settings rs ON rs.pair_id=p.id
-               WHERE p.active=TRUE AND rs.reminders_on=TRUE"""
+               WHERE p.active=1 AND rs.reminders_on=1"""
         )
+        return await cur.fetchall()
 
 
 # ── Check-ins ──────────────────────────────────────────────────────────────────
 
-async def add_checkin(pool, pair_id, sub_id, mood, note=None) -> int:
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "INSERT INTO checkins (pair_id,sub_id,mood,note) VALUES ($1,$2,$3,$4) RETURNING id",
-            pair_id, sub_id, mood, note,
+async def add_checkin(pair_id, sub_id, mood, note=None) -> int:
+    async with await get_conn() as conn:
+        cur = await conn.execute(
+            "INSERT INTO checkins (pair_id,sub_id,mood,note) VALUES (?,?,?,?)",
+            (pair_id, sub_id, mood, note),
         )
-        return row["id"]
+        await conn.commit()
+        return cur.lastrowid
 
 
-async def get_recent_checkins(pool, pair_id, limit=7):
-    async with pool.acquire() as conn:
-        return await conn.fetch(
-            "SELECT * FROM checkins WHERE pair_id=$1 ORDER BY checked_at DESC LIMIT $2",
-            pair_id, limit,
+async def get_recent_checkins(pair_id, limit=7):
+    async with await get_conn() as conn:
+        cur = await conn.execute(
+            "SELECT * FROM checkins WHERE pair_id=? ORDER BY checked_at DESC LIMIT ?",
+            (pair_id, limit),
         )
+        return await cur.fetchall()
+
+
+async def get_today_checkin(pair_id, sub_id):
+    async with await get_conn() as conn:
+        cur = await conn.execute(
+            """SELECT * FROM checkins
+               WHERE pair_id=? AND sub_id=?
+               AND date(checked_at)=date('now')
+               ORDER BY checked_at DESC LIMIT 1""",
+            (pair_id, sub_id),
+        )
+        return await cur.fetchone()
