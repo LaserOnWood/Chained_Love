@@ -13,7 +13,7 @@ import os
 import discord
 from discord.ext import commands
 
-from utils.database import init_db
+from utils.database import init_db, close_db
 
 logging.basicConfig(
     level=logging.INFO,
@@ -74,8 +74,11 @@ async def main():
     if not token:
         raise RuntimeError("Variable d'environnement DISCORD_TOKEN manquante.")
     bot = ChainedLove()
-    async with bot:
-        await bot.start(token)
+    try:
+        async with bot:
+            await bot.start(token)
+    finally:
+        await close_db()
 
 
 if __name__ == "__main__":
