@@ -93,6 +93,46 @@ class JournalCog(commands.Cog, name="Journal"):
             ephemeral=True,
         )
 
+    @app_commands.command(name="sub_history", description="[DOM] Voir l'historique des check-ins de ton/ta subordonné·e.")
+    @app_commands.describe(sub="Le/la subordonné·e à consulter")
+    async def sub_history(self, interaction: discord.Interaction, sub: discord.Member):
+        uid, gid = interaction.user.id, interaction.guild_id
+        # Vérifier si l'utilisateur est bien le dominant de ce sub
+        pair = await db.get_pair_by_users(uid, sub.id, gid)
+        
+        if not pair or pair["dom_id"] != uid or pair["sub_id"] != sub.id:
+            await interaction.response.send_message(
+                embed=error(f"Tu n'as pas de liaison active en tant que dominant·e avec {sub.display_name}."), 
+                ephemeral=True
+            )
+            return
+            
+        checkins = await db.get_recent_checkins(pair["id"], limit=10)
+        if not checkins:
+            await interaction.response.send_message(
+                embed=embed(f"📖 Historique de {sub.display_name}", "Aucun check-in trouvé pour le moment.", color="info"),
+                ephemeral=True,
+            )
+            return
+            
+        lines = []
+        for c in checkins:
+            # Formatage de la date plus lisible
+            date_str = c["checked_at"][:16].replace("T", " ")
+            note_str = f" – _{c['note']}_" if c["note"] else ""
+            lines.append(f"`{date_str}` {mood_emoji(c['mood'])} **{c['mood']}/10**{note_str}")
+            
+        avg = round(sum(c["mood"] for c in checkins) / len(checkins), 1)
+        
+        e = discord.Embed(
+            title=f"📖 État de {sub.display_name}",
+            description="\n".join(lines) + f"\n\n**Moyenne (10 derniers) : {avg}/10**",
+            color=0x9B59B6
+        )
+        e.set_thumbnail(url=sub.display_avatar.url)
+        
+        await interaction.response.send_message(embed=e, ephemeral=True)
+
     @app_commands.command(name="stats", description="Statistiques de la semaine pour ta liaison.")
     @app_commands.describe(partner="Ton/ta partenaire (optionnel)")
     async def stats(self, interaction: discord.Interaction, partner: discord.Member = None):
