@@ -27,6 +27,7 @@ COGS = [
     "cogs.economy",   # Module 3 – Points & boutique
     "cogs.safety",    # Module 4 – Safewords & limites
     "cogs.journal",   # Module 5 – Journal, check-ins, stats
+    "cogs.exportBDD"
 ]
 
 intents = discord.Intents.default()
